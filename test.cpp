@@ -204,7 +204,13 @@ namespace Parser {
             using boost::spirit::repository::qi::distinct;
             auto kw = distinct(char_("a-zA-Z0-9_"));
 
-            start   = skip(space) [matches[kw["strict"]] >> kind_ >> graph_];
+            skipper 
+                = space
+                | ("//" >> *(char_ - eol))
+                | ("/*" >> (char_ - "*/") >> "*/")
+                ;
+
+            start   = skip(skipper) [matches[kw["strict"]] >> kind_ >> graph_];
 
             kind_  %= kw["digraph"] >> attr(GraphKind::directed)   [ set_arrow_(px::val("->")) ]
                     | kw["graph"]   >> attr(GraphKind::undirected) [ set_arrow_(px::val("--")) ]
@@ -255,7 +261,8 @@ namespace Parser {
 
       private:
         ////////////////////////
-        using Skipper = qi::space_type;
+        using Skipper = qi::rule<It>;
+        Skipper skipper;
 
         //////////////////////////////
         // Arrows depend on GraphKind
