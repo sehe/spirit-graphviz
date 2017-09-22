@@ -20,11 +20,11 @@ SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} \
     -L ${BOOST_DIR}/stage/lib \
     -Wall -Wextra -pedantic \
     -std=c++1z \
-    -ftemplate-depth=19000 \
     -isystem /usr/include/mpich \
     -fsanitize=address,undefined \
     -g -Os -pthread -march=native")
     #-isystem /home/sehe/custom/nonius/include \
+    #-ftemplate-depth=19000 \
     #-I /home/sehe/custom/spirit/include \
     #-isystem /home/sehe/custom/beast/include \
     #-isystem /home/sehe/custom/uri/include \
