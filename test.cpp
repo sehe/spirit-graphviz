@@ -18,8 +18,8 @@ namespace Model {
 
     struct NodeRef {
         Id id;
-        Id port;
-        CompassPoint compass_pt = CompassPoint::_;
+        Id mutable port; // non-key field
+        CompassPoint mutable compass_pt = CompassPoint::_; // non-key field
 
         bool operator<(NodeRef const& o) const {
             return std::tie(id, port, compass_pt) < std::tie(o.id, o.port, o.compass_pt);
@@ -36,6 +36,8 @@ namespace Model {
     struct Node {
         Id id;
         Attributes attributes;
+
+        Node(Id id) : id(id) {}
 
         std::string label() const { return get(attributes, "label", id); }
     };
@@ -66,13 +68,17 @@ namespace Model {
 
         Id id;
         Attributes attributes;
-        std::set<Id> owned_nodes;
         SubGraphs subgraphs;
 
         std::string label() const { return get(attributes, "label", id); }
     };
 
-    using Nodes = std::map<Id, Node>;
+    struct OwnedNode {
+        Node node;
+        SubGraph const* owner;
+    };
+
+    using Nodes = std::map<Id, OwnedNode>;
     using Edges = std::multiset<Edge, Edge::IdsOnlyCmp>; // Note: builder assumes reference stability
 
     struct MainGraph {
@@ -82,7 +88,8 @@ namespace Model {
         Edges     all_edges;
         SubGraph  graph;
 
-        Edge const& ensure_edge(NodeRef from, NodeRef to);
+        Edge const& ensure_edge(NodeRef from, NodeRef to, SubGraph const& owner);
+        Node&       ensure_node(Id id, SubGraph const& owner);
     };
 }
 
@@ -242,9 +249,6 @@ namespace Parser {
             graph_    = -ID_ >> stmt_list;
             subgraph_ = -(kw["subgraph"] >> -ID_) >> stmt_list;
 
-            string_   = '"' >> *('\\' >> char_ | ~char_('"')) >> '"';
-            ID_       = string_ | +char_("a-zA-Z0-9_");
-
             stmt_list = '{' >> *(stmt >> -lit(';')) >> '}';
 
             stmt      = attr_stmt
@@ -270,9 +274,9 @@ namespace Parser {
             attr_list = +a_list;
 
             node_id = 
-                !kw[attr_group|"subgraph"] >>  // weed out "graph", "node", "edge", "subgraph" for efficiency (this line is optional)
+                !kw[attr_group|"subgraph"] >>  // prohibited node ids
                 ID_ >> (
-                        (attr(Ast::Id{}))              >> (':' >> kw[compass_pt]) >> !lit(':')
+                        (attr(Ast::Id{})) >> (':' >> kw[compass_pt]) >> !lit(':')
                       | (':' >> ID_ | attr(Ast::Id{})) >> (':' >> kw[compass_pt] | attr(Ast::CompassPoint::_))
                 )
                 ;
@@ -282,7 +286,7 @@ namespace Parser {
                  (a_list) (attr_list)
                  (stmt) (attr_stmt) (attribute) (node_stmt) (edge_stmt) (stmt_list)
                  (node_id)
-                 (start)(kind_)(ID_)(string_)
+                 (start)(kind_)
                  //(skipper)
             )
         }
@@ -351,13 +355,161 @@ namespace Parser {
         using GraphKind = Ast::GraphKind;
         qi::rule<It, Ast::GraphViz()> start;
         qi::rule<It, GraphKind()> kind_;
-        qi::rule<It, Ast::Id()> ID_;
-        qi::rule<It, std::string()> string_;
+
+        // Separate grammar for ID parsing (slightly optimizing isBareId)
+        friend bool isBareId(std::string const&);
+
+        struct IdParser : qi::grammar<It, Ast::Id()> {
+            IdParser() : IdParser::base_type(ID) {
+                using namespace qi;
+                quoted   = '"' >> *('\\' >> char_ | ~char_('"')) >> '"';
+                HTML     = eps(false); // TODO implement?
+                bareId   = char_("a-zA-Z_\200-\377") >> *char_("a-zA-Z0-9_\200-\377")
+                         | raw [ -lit('-') >> ('.' >> +digit | +digit >> -('.' >> *digit)) ]
+                         ;
+                ID       = quoted 
+                         | bareId
+                         | HTML
+                         ;
+
+                BOOST_SPIRIT_DEBUG_NODES((ID)(HTML)(quoted)(bareId))
+            }
+
+            qi::rule<It, Ast::Id()> ID, HTML, quoted, bareId;
+        };
+
+        IdParser ID_;
     };
+
+    bool isBareId(std::string const& id) {
+        static GraphViz<std::string::const_iterator>::IdParser const s_id_parser;
+        return parse(id.begin(), id.end(), s_id_parser.bareId >> qi::eoi);
+    }
+
 }
 
 #include <fstream>
 #include <iomanip>
+
+namespace Model {
+    namespace IO {
+
+        struct graphviz_printer {
+            MainGraph const& _main;
+            std::string const _indent;
+
+            friend std::ostream& operator<<(std::ostream& os, graphviz_printer const& manip) {
+                manip.print(os);
+                return os;
+            }
+
+          private:
+            struct ID_Wrap {
+                std::string const& _s;
+
+                friend std::ostream& operator<<(std::ostream& os, ID_Wrap const& manip) {
+                    if (Parser::isBareId(manip._s))
+                        return os << manip._s;
+                    else
+                        return os << std::quoted(manip._s);
+                }
+            };
+
+            static ID_Wrap ID(std::string const& s) { return {s}; }
+
+            void print(std::ostream& os) const {
+                if (_main.strict) os << "strict ";
+                switch (_main.kind) {
+                    case GraphKind::undirected: os << "graph "; break;
+                    case GraphKind::directed: os << "digraph "; break;
+                }
+                print(os, _main.graph);
+            }
+
+            void print(std::ostream& os, SubGraph const& g) const {
+                if (g.id.size())
+                    os << ID(g.id) << " ";
+                os << "{";
+
+                graphviz_printer{_main, _indent+"    "}.print_contents(os, g);
+
+                os << "\n" << _indent << "}";
+            }
+
+            void print_contents(std::ostream& os, SubGraph const& g) const {
+                if (!g.attributes.empty()) {
+                    os << "\n" << _indent << "graph";
+                    print(os, g.attributes);
+                    os << ";";
+                }
+                    
+                graphviz_printer nested{_main, _indent + "  "};
+                for (auto& owned_node : _main.all_nodes) {
+                    if (owned_node.second.owner == &g) {
+                        os << "\n" << _indent;
+                        nested.print(os, owned_node.second.node);
+                    }
+                }
+
+                for (auto& sub : g.subgraphs) {
+                    os << "\n" << _indent << "subgraph ";
+                    print(os, sub.second);
+                }
+
+                if (&g == &_main.graph) {
+                    for (auto& edge : _main.all_edges) {
+                        print(os, edge);
+                    }
+                }
+            }
+
+            void print(std::ostream &os, Edge const &edge) const {
+                os << "\n" << _indent;
+                print(os, edge.from);
+                os << (_main.kind==GraphKind::directed?" -> ":" -- ");
+                print(os, edge.to);
+                print(os, edge.attributes);
+                os << ";";
+            }
+
+            void print(std::ostream &os, NodeRef const &nref) const {
+                os << nref.id;
+                if (!nref.port.empty()) os << ":" << nref.port;
+                if (nref.compass_pt!=CompassPoint::_) os << ":" << nref.compass_pt;
+            }
+
+            void print(std::ostream &os, Attributes const &attributes) const {
+                if (attributes.empty())
+                    return;
+                os << '[';
+                graphviz_printer nested{ _main, _indent + "         " };
+                bool first = true;
+                for (auto &attr : attributes) {
+                    if (first) {
+                        first = false;
+                    } else {
+                        //os << "\n" << _indent;
+                    }
+                    os << ID(attr.first) << '=' << ID(attr.second);
+                    if (&attr != &*attributes.rbegin())
+                        os << ",";
+                }
+                os << ']';
+            }
+
+            void print(std::ostream& os, Node const& n) const {
+                os << ID(n.id);
+                print(os, n.attributes);
+                os << ";";
+            }
+        };
+
+    }
+
+    IO::graphviz_printer graphviz(MainGraph const& mg) {
+        return { mg, "" };
+    }
+}
 
 int main() {
     using It = boost::spirit::istream_iterator;
@@ -372,9 +524,11 @@ int main() {
 
         if (ok) {
             std::cout << "Parse success\n";
-            std::cout << into << "\n";
+            //std::cout << into << "\n";
 
             auto x = buildModel(into);
+
+            std::cout << graphviz(x) << "\n";
         } else {
             std::cout << "Parse failed\n";
         }
@@ -405,12 +559,35 @@ namespace Model {
         return subgraphs.emplace(key, SubGraph(key))->second;
     }
 
-    Edge const& MainGraph::ensure_edge(NodeRef from, NodeRef to) {
+    Node& MainGraph::ensure_node(Id id, SubGraph const& owner) {
+        OwnedNode addendum {Node {id}, &owner}; 
+
+        auto res = all_nodes.emplace(id, addendum);
+        auto& element = res.first->second;
+
+        if (res.second) {
+            std::cout << "Creating node " << id << " in graph " << owner.id << "\n";
+        } else {
+            if (&owner != element.owner)
+                std::cout << "Reassigning node " << id 
+                          << (element.owner? " from graph " + element.owner->id : "")
+                          << " to graph " << owner.id << "\n";
+        }
+
+        element.owner = &owner;
+        return element.node;
+    }
+
+    Edge const& MainGraph::ensure_edge(NodeRef from, NodeRef to, SubGraph const& owner) {
         if (kind != GraphKind::directed) {
             if (to < from)
                 std::swap(from, to); // fix order for consistency
         }
+        //std::cout << "Ensure edge " << from << " .. " << to << "\n";
 
+        ensure_node(from.id, owner);
+        ensure_node(to.id, owner);
+        
         Edge addendum { from, to, {} };
 
         if (strict) {
@@ -433,17 +610,21 @@ namespace Model {
 
         return *all_edges.insert(std::move(addendum));
     }
-            
+
 }
 
 namespace Ast {
     namespace detail {
         using NodeRefSet = std::set<NodeRef>;
 
-        static void apply_attributes(Ast::AttrList const& source, Model::Attributes& target) {
-            for (auto& a_list : source)
-                for (auto& a : a_list)
-                    target[a.first] = a.second;
+        static void apply_attributes(Ast::AList const& a_list, Model::Attributes& target) {
+            for (auto& a : a_list)
+                target[a.first] = a.second;
+        }
+
+        static void apply_attributes(Ast::AttrList const& attr_list, Model::Attributes& target) {
+            for (auto& a_list : attr_list)
+                apply_attributes(a_list, target);
         }
 
         struct ModelBuilder {
@@ -467,20 +648,26 @@ namespace Ast {
             Stack _stack;
 
             struct Leaver { // exception safe stack frame cleanup
-                Leaver(Stack& stack) : _ref(stack) { }
+                Leaver(Stack& stack) : _ptr(&stack) { }
                 Leaver(Leaver const&) = delete;
-                Leaver(Leaver&& other) : _ref(other._ref) { other.disarm(); }
+                Leaver(Leaver&& other) : _ptr(other._ptr) { other.disarm(); }
+                Leaver& operator=(Leaver&& other) {
+                    _ptr   = other._ptr;
+                    _armed = other._armed;
+                    other._armed = false;
+                    return *this;
+                }
 
                 ~Leaver() {
                     if (_armed) {
-                        assert(_ref.size());
-                        _ref.pop_back();
+                        assert(_ptr && _ptr->size());
+                        _ptr->pop_back();
                     }
                 }
 
                 void disarm() { _armed = false; }
               private:
-                Stack& _ref;
+                Stack* _ptr;
                 bool _armed = true;
             };
 
@@ -517,17 +704,19 @@ namespace Ast {
             }
 
             NodeRefSet transform(Ast::Graph const& src, bool root_graph = false) {
-                if (root_graph) {
-                    if (src.id) {
-                        cur_graph().id = *src.id;
-                    }
+                NodeRefSet reffed;
+                boost::optional<Leaver> hold;
 
-                    return transform(src.stmt_list);
+                if (root_graph) { // maingraph root already exists; just set properties
+                    if (src.id) { cur_graph().id = *src.id; }
                 } else {
-                    auto hold = enter(cur_graph().ensure_subgraph(src.id));
-
-                    return transform(src.stmt_list);
+                    hold = enter(cur_graph().ensure_subgraph(src.id));
                 }
+
+                reffed = transform(src.stmt_list);
+                apply_attributes(ToS().graph_attrs, cur_graph().attributes);
+
+                return reffed;
             };
 
             NodeRefSet transform(Ast::StmtList const& src) {
@@ -564,11 +753,11 @@ namespace Ast {
                 if (src.hops.size() > 1) {
                     for (auto lhs = src.hops.begin(), rhs = std::next(lhs); rhs != src.hops.end(); ++lhs, ++rhs) {
                         auto lhs_refs = apply_visitor(*this, *lhs);
-                        auto rhs_refs = apply_visitor(*this, *lhs);
+                        auto rhs_refs = apply_visitor(*this, *rhs);
 
                         for (auto from : lhs_refs)
                             for (auto to : rhs_refs)
-                                path.push_back(cur_main().ensure_edge(from, to));
+                                path.push_back(cur_main().ensure_edge(from, to, cur_graph()));
 
                         all_referenced.insert(lhs_refs.begin(), lhs_refs.end());
                         all_referenced.insert(rhs_refs.begin(), rhs_refs.end());
@@ -581,25 +770,45 @@ namespace Ast {
 
                 // apply attributes to all edges in this statement
                 for (Model::Edge const& e : path) {
-                    apply_attributes(src.attributes, e.attributes);
+                    apply_attributes(ToS().edge_attrs, e.attributes); // ambient
+                    apply_attributes(src.attributes, e.attributes); // declared
                 }
 
+                // Subgraphs return "naked" node ids, not full refs
+                // so we clear out any ports with respect to any edge endpoints
+                for (auto& ref : all_referenced) {
+                    ref.port = "";
+                    ref.compass_pt = CompassPoint::_;
+                }
                 return all_referenced;
             }
 
             NodeRefSet transform(NodeRef const& src) {
-                std::cout << "TODO IMPLEMENT " << __PRETTY_FUNCTION__ << "\n";
+                auto& node = cur_main().ensure_node(src.id, cur_graph());
+                apply_attributes(ToS().node_attrs, node.attributes); // ambient
+
+                // single node refs return the full ref for optional use as
+                // edge endpoint, even if it implicitly declared a node.
                 return { src };
             }
 
-            //void transform(NodeStmt const& src) {
-            //}
+            NodeRefSet transform(NodeStmt const& src) {
+                auto& node = cur_main().ensure_node(src.node_id.id, cur_graph());
 
-            template <typename T>
-            NodeRefSet transform(T&&) const {
-                std::cout << "TODO IMPLEMENT " << __PRETTY_FUNCTION__ << "\n";
-                return {};
+                apply_attributes(ToS().node_attrs, node.attributes); // ambient
+                apply_attributes(src.attributes, node.attributes); // declared
+
+                // single node refs return the full ref for optional use as
+                // edge endpoint, even if it implicitly declared a node.
+                return { src.node_id };
             }
+
+            //template <typename T>
+            //NodeRefSet transform(T&& src) const {
+                //std::cout << "TODO IMPLEMENT " << __PRETTY_FUNCTION__ << "\n";
+                //std::cout << "src: " << src << "\n";
+                //return {};
+            //}
         };
     }
 
