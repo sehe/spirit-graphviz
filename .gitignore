@@ -1,0 +1,9 @@
+*.cmake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+Session.vim
+spirit-graphviz
+tests/available/oneliner.*.dot
+tests/enabled/
+tests/output/

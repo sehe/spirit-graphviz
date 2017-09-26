@@ -1,0 +1,18 @@
+digraph        { a -> b          } 
+digraph ""     { a -> b          } 
+digraph -3.14  { a -> b          } 
+digraph "pi"   { a -> b          } 
+       graph   { a -- b; b -- a; } 
+strict graph   { a -- b; b -- a; } 
+       graph   { b -- a; a -- b; } 
+strict graph   { b -- a; a -- b; } 
+       digraph { a -> b; b -> a; } 
+strict digraph { a -> b; b -> a; } 
+       digraph { a -> b; a -> b; } 
+strict digraph { a -> b; a -> b; } 
+digraph        { a  b  a -> b                } // semicolons optional
+digraph        { a; b; a -> b;               } 
+digraph        { a; b;                       { a -> b; }  } 
+digraph        { a; b; subgraph              { a -> b; }  } 
+digraph        { a; b; subgraph named        { a -> b; }  } 
+digraph        { a; b; subgraph clusterNamed { a -> b; }  } 

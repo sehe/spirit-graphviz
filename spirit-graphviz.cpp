@@ -2,13 +2,17 @@
 #include <boost/spirit/include/qi.hpp>
 #include <boost/spirit/repository/include/qi_distinct.hpp>
 #include <boost/fusion/adapted.hpp>
+#include <boost/multi_index_container.hpp>
+#include <boost/multi_index/mem_fun.hpp>
+#include <boost/multi_index/ordered_index.hpp>
+#include <boost/multi_index/sequenced_index.hpp>
 #include <map>
 #include <set>
 
 namespace Model {
     ////////////////////////
     // Shared primitives
-    using Id = std::string;
+    using Id         = std::string;
     using OptionalId = boost::optional<Id>;
 
     using Attributes = std::map<Id, std::string>;
@@ -35,7 +39,7 @@ namespace Model {
 
     struct Node {
         Id id;
-        Attributes attributes;
+        Attributes mutable attributes; // non-key field mutable
 
         Node(Id id) : id(id) {}
 
@@ -76,9 +80,22 @@ namespace Model {
     struct OwnedNode {
         Node node;
         SubGraph const* owner;
+
+        Id const& id() const { return node.id; }
     };
 
-    using Nodes = std::map<Id, OwnedNode>;
+
+    namespace bmi = boost::multi_index;
+
+    using Nodes = boost::multi_index_container<
+        OwnedNode,
+        bmi::indexed_by<
+            bmi::ordered_unique<
+                bmi::tag<struct by_node_id>,
+                bmi::const_mem_fun<OwnedNode, Id const&, &OwnedNode::id>
+            >,
+            bmi::sequenced<bmi::tag<struct by_insertion>>
+        > > ; // std::map<Id, OwnedNode>;
     using Edges = std::multiset<Edge, Edge::IdsOnlyCmp>; // Note: builder assumes reference stability
 
     struct MainGraph {
@@ -89,7 +106,7 @@ namespace Model {
         SubGraph  graph;
 
         Edge const& ensure_edge(NodeRef from, NodeRef to, SubGraph const& owner);
-        Node&       ensure_node(Id id, SubGraph const& owner);
+        Node const& ensure_node(Id id, SubGraph const& owner);
     };
 }
 
@@ -444,10 +461,10 @@ namespace Model {
                 }
                     
                 graphviz_printer nested{_main, _indent + "  "};
-                for (auto& owned_node : _main.all_nodes) {
-                    if (owned_node.second.owner == &g) {
+                for (auto& owned_node : _main.all_nodes.get<by_insertion>()) {
+                    if (owned_node.owner == &g) {
                         os << "\n" << _indent;
-                        nested.print(os, owned_node.second.node);
+                        nested.print(os, owned_node.node);
                     }
                 }
 
@@ -511,11 +528,11 @@ namespace Model {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
     using It = boost::spirit::istream_iterator;
     Parser::GraphViz<It> parser;
 
-    std::ifstream ifs("g.dot");
+    std::ifstream ifs(argc>1? argv[1] : "g.dot");
     It f{ifs >> std::noskipws}, l;
 
     Ast::GraphViz into;
@@ -523,20 +540,20 @@ int main() {
         bool ok = parse(f, l, parser, into);
 
         if (ok) {
-            std::cout << "Parse success\n";
-            //std::cout << into << "\n";
+            std::cerr << "Parse success\n";
+            //std::cerr << into << "\n";
 
             auto x = buildModel(into);
 
-            std::cout << graphviz(x) << "\n";
+            std::cout << "// generated from c++\n" << graphviz(x) << "\n";
         } else {
-            std::cout << "Parse failed\n";
+            std::cerr << "Parse failed\n";
         }
 
         if (f != l)
-            std::cout << "Remaining unparsed input: '" << std::string(f,l) << "'\n";
+            std::cerr << "Remaining unparsed input: '" << std::string(f,l) << "'\n";
     } catch (Parser::qi::expectation_failure<It> const& e) {
-        std::cout << e.what() << ": " << e.what_ << " at " << std::string(e.first, e.last) << "\n";
+        std::cerr << e.what() << ": " << e.what_ << " at " << std::string(e.first, e.last) << "\n";
     }
 }
 
@@ -559,31 +576,27 @@ namespace Model {
         return subgraphs.emplace(key, SubGraph(key))->second;
     }
 
-    Node& MainGraph::ensure_node(Id id, SubGraph const& owner) {
+    Node const& MainGraph::ensure_node(Id id, SubGraph const& owner) {
         OwnedNode addendum {Node {id}, &owner}; 
 
-        auto res = all_nodes.emplace(id, addendum);
-        auto& element = res.first->second;
+        auto res = all_nodes.insert(addendum);
+        auto& element = *res.first;
 
         if (res.second) {
-            std::cout << "Creating node " << id << " in graph " << owner.id << "\n";
+            std::cerr << "Creating node " << id << " in graph " << owner.id << "\n";
         } else {
             if (&owner != element.owner)
-                std::cout << "Reassigning node " << id 
-                          << (element.owner? " from graph " + element.owner->id : "")
-                          << " to graph " << owner.id << "\n";
+                std::cerr << "Reassigning node " << id 
+                          << (element.owner? " from graph '" + element.owner->id + "'" : "")
+                          << " to graph '" << owner.id << "'\n";
         }
 
-        element.owner = &owner;
+        all_nodes.modify(res.first, [&owner](OwnedNode& on) { on.owner = &owner; });
         return element.node;
     }
 
     Edge const& MainGraph::ensure_edge(NodeRef from, NodeRef to, SubGraph const& owner) {
-        if (kind != GraphKind::directed) {
-            if (to < from)
-                std::swap(from, to); // fix order for consistency
-        }
-        //std::cout << "Ensure edge " << from << " .. " << to << "\n";
+        std::cerr << "Ensure edge " << from << " .. " << to << "\n";
 
         ensure_node(from.id, owner);
         ensure_node(to.id, owner);
@@ -591,23 +604,40 @@ namespace Model {
         Edge addendum { from, to, {} };
 
         if (strict) {
+            bool inverted = false;
             auto range = all_edges.equal_range(addendum);
+
+            if (range.first == range.second && kind != GraphKind::directed) {
+                inverted = true;
+                std::swap(addendum.from, addendum.to);
+                range = all_edges.equal_range(addendum);
+                std::swap(addendum.from, addendum.to); // restore in case no match
+            }
 
             if (range.first != range.second) { // already present
 
                 // get the known attrs, and remove
                 addendum = *range.first;
+
+                std::cerr << "DEBUG: " << kind << " edge duplicates " << addendum.from << " - " << addendum.to << " " << (inverted?"(inv)":"") << "\n";
+
                 range.first = all_edges.erase(range.first);
 
                 // assert there wasn't a dup already
                 assert(range.first == range.second);
 
                 // behaviour of Graphviz is to take port/compass from the last spelling encountered
-                addendum.from = from;
-                addendum.to = to;
+                if (inverted) {
+                    addendum.from = to;
+                    addendum.to = from;
+                } else {
+                    addendum.from = from;
+                    addendum.to = to;
+                }
             }
         }
 
+        std::cerr << " - inserted edge " << addendum.from << " .. " << addendum.to << "\n";
         return *all_edges.insert(std::move(addendum));
     }
 
@@ -661,6 +691,7 @@ namespace Ast {
                 ~Leaver() {
                     if (_armed) {
                         assert(_ptr && _ptr->size());
+                        std::cerr << "*** Leaving subgraph '" << _ptr->back().graph.id << "'\n";
                         _ptr->pop_back();
                     }
                 }
@@ -681,6 +712,7 @@ namespace Ast {
             }
 
             Leaver enter(Model::SubGraph& subgraph) {
+                std::cerr << "*** Entering subgraph '" << subgraph.id << "'\n";
                 _stack.emplace_back(subgraph, ToS());
                 return Leaver(_stack);
             };
@@ -805,8 +837,8 @@ namespace Ast {
 
             //template <typename T>
             //NodeRefSet transform(T&& src) const {
-                //std::cout << "TODO IMPLEMENT " << __PRETTY_FUNCTION__ << "\n";
-                //std::cout << "src: " << src << "\n";
+                //std::cerr << "TODO IMPLEMENT " << __PRETTY_FUNCTION__ << "\n";
+                //std::cerr << "src: " << src << "\n";
                 //return {};
             //}
         };
